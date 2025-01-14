@@ -9,10 +9,7 @@ import numpy as np
 import yaml
 from matplotlib.patches import Rectangle
 from PIL import Image
-import httpx
-import os
 import base64
-import cv2
 import google.generativeai as genai
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -149,6 +146,30 @@ def crop_image(image: np.ndarray, bbox: tuple[int, int, int, int]) -> np.ndarray
     return image[top : bottom + 1, left : right + 1]
 
 
+def draw_text(
+    image: np.ndarray, 
+    text: str, 
+    org=(10, 30), 
+    color=(255, 0, 0), 
+    font_scale=1.0, 
+    thickness=2
+) -> np.ndarray:
+    """
+    Draws 'text' on the image at position 'org'.
+    """
+    image_copy = image.copy()
+    cv2.putText(
+        image_copy, 
+        text, 
+        org, 
+        cv2.FONT_HERSHEY_SIMPLEX, 
+        font_scale, 
+        color, 
+        thickness, 
+        lineType=cv2.LINE_AA
+    )
+    return image_copy
+
 
 def gemini_annotate_image(image: np.ndarray) -> dict:
     """
@@ -156,8 +177,10 @@ def gemini_annotate_image(image: np.ndarray) -> dict:
     Returns a dict with the annotation result.
     """
 
-    # 1. Encode the np.ndarray as JPEG in memory
+    # 1. Configure your Google GenAI
     genai.configure(api_key="")
+
+    # 2. Encode the np.ndarray as JPEG in memory
     success, encoded_img = cv2.imencode('.jpg', image)
     if not success:
         raise ValueError("Failed to encode image to .jpg format.")
@@ -165,41 +188,44 @@ def gemini_annotate_image(image: np.ndarray) -> dict:
     encoded_bytes = encoded_img.tobytes()
     encoded_base64_str = base64.b64encode(encoded_bytes).decode('utf-8')
 
-
+    # 3. Create your model reference and prompt
     model = genai.GenerativeModel(model_name="gemini-1.5-pro")
-    prompt = "Can you extract and predict what's in this image and give the exact OCR text in the image? Text should strictly be two to three words."
+    prompt = "Extract label text and predict the image data exactly in two to three words. No extra content please."
 
+    # 4. Send the prompt along with the Base64 image
     response = model.generate_content(
         [
             {
-                'mime_type': 'image/jpeg', 
+                'mime_type': 'image/jpeg',
                 'data': encoded_base64_str
             },
             prompt
         ]
     )
 
+    # 5. Return Gemini's annotation response
     return {
         "status": "ok",
         "annotation": response.text
     }
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str)
     parser.add_argument("--weight_url", type=str, default=None)
     parser.add_argument("--multimask", action="store_true")
-    parser.add_argument("--image_path", type=str, default="assets/fig/cat.jpg")
-    parser.add_argument("--output_path", type=str, default=".demo/efficientvit_sam_demo.png")
+    parser.add_argument("--image_path", type=str, default="assets/fig/1.jpg")
+    parser.add_argument("--output_path", type=str, default="assets/1.jpg")
 
     parser.add_argument("--mode", type=str, default="all", choices=["point", "box", "all"])
     parser.add_argument("--point", type=str, default=None)
     parser.add_argument("--box", type=str, default=None)
 
     # EfficientViTSamAutomaticMaskGenerator args
-    parser.add_argument("--pred_iou_thresh", type=float, default=0.8)
+    parser.add_argument("--pred_iou_thresh", type=float, default=0.85)
     parser.add_argument("--stability_score_thresh", type=float, default=0.85)
-    parser.add_argument("--min_mask_region_area", type=float, default=100)
+    parser.add_argument("--min_mask_region_area", type=float, default=600)
 
     args, opt = parser.parse_known_args()
     opt = parse_unknown_args(opt)
@@ -237,31 +263,44 @@ def main():
         plt.close()
 
         # 3. Additionally, crop out each mask and send to Gemini
-        #    (Note that each 'masks[i]' is a dict with 'segmentation' and 'area', etc.)
         sorted_masks = sorted(masks, key=lambda x: x["area"], reverse=True)
+
+        # Prepare a directory for the labeled subimages
+        crop_dir = os.path.join(os.path.dirname(args.output_path), "mask_crops")
+        os.makedirs(crop_dir, exist_ok=True)
+
         for i, ann in enumerate(sorted_masks):
+            if i >= 30:
+              break
+              
             segmentation = ann["segmentation"].astype(np.uint8)  # shape: [H, W]
             # Get bounding box for this particular mask
-            (left, top, right, bottom) = get_mask_bounding_box(segmentation)
+            left, top, right, bottom = get_mask_bounding_box(segmentation)
 
             # Crop the original image by that box
             sub_image = crop_image(raw_image, (left, top, right, bottom))
 
-            # (Optional) If you want the sub-mask in the same dimension as sub_image:
-            #   mask_cropped = crop_image(segmentation * 255, (left, top, right, bottom))
-
             # 4. Send each sub-image to Gemini for annotation
             gemini_result = gemini_annotate_image(sub_image)
+            annotation = gemini_result["annotation"]
 
-            # 5. Save or log the Gemini result as needed
-            print(f"[Gemini] Mask {i} bounding box: {left, top, right, bottom}")
-            print(f"[Gemini] Annotation result: {gemini_result}")
+            # 5. (Optional) Draw that annotation text on the sub-image
+            sub_image_labeled = draw_text(
+                sub_image, 
+                text=annotation, 
+                org=(10, 30), 
+                color=(0, 255, 0),  # Green text
+                font_scale=1.0, 
+                thickness=2
+            )
 
-            # 6. Optionally, save each cropped region as an image
-            crop_dir = os.path.join(os.path.dirname(args.output_path), "mask_crops")
-            os.makedirs(crop_dir, exist_ok=True)
+            # 6. Save or log the Gemini result
+            print(f"[Gemini] Mask {i} bounding box: {(left, top, right, bottom)}")
+            print(f"[Gemini] Annotation result: {annotation}")
+
+            # Save each labeled region
             crop_filename = os.path.join(crop_dir, f"mask_{i:03d}.png")
-            Image.fromarray(sub_image).save(crop_filename)
+            Image.fromarray(sub_image_labeled).save(crop_filename)
 
     elif args.mode == "point":
         # If no point is specified, default to center of the image
