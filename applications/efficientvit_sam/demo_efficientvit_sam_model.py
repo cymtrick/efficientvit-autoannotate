@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import time
+import json  # <-- NEW: For saving to JSON
 
 import cv2
 import matplotlib.pyplot as plt
@@ -176,11 +177,8 @@ def gemini_annotate_image(image: np.ndarray) -> dict:
     Sends a sub-image (np.ndarray) to Gemini for annotation.
     Returns a dict with the annotation result.
     """
+    genai.configure(api_key="")
 
-    # 1. Configure your Google GenAI
-    genai.configure(api_key="AIzaSyCSZz1Ig-fLZXPkDh-dNwBCSi7sdc3AaZk")
-
-    # 2. Encode the np.ndarray as JPEG in memory
     success, encoded_img = cv2.imencode('.jpg', image)
     if not success:
         raise ValueError("Failed to encode image to .jpg format.")
@@ -188,11 +186,9 @@ def gemini_annotate_image(image: np.ndarray) -> dict:
     encoded_bytes = encoded_img.tobytes()
     encoded_base64_str = base64.b64encode(encoded_bytes).decode('utf-8')
 
-    # 3. Create your model reference and prompt
     model = genai.GenerativeModel(model_name="gemini-1.5-pro")
-    prompt = "Extract label text and predict the image data exactly in two to three words. No extra content please."
+    prompt = "Extract label text and predict the image data exactly in two to three words along with confidence score only in numerical percentile. No extra content please."
 
-    # 4. Send the prompt along with the Base64 image
     response = model.generate_content(
         [
             {
@@ -203,7 +199,6 @@ def gemini_annotate_image(image: np.ndarray) -> dict:
         ]
     )
 
-    # 5. Return Gemini's annotation response
     return {
         "status": "ok",
         "annotation": response.text
@@ -222,7 +217,9 @@ def main():
     parser.add_argument("--point", type=str, default=None)
     parser.add_argument("--box", type=str, default=None)
 
-    # EfficientViTSamAutomaticMaskGenerator args
+    parser.add_argument("--json_path", type=str, default="mask_anns.json",
+                        help="Path to save mask bounding boxes and annotations in JSON.")
+
     parser.add_argument("--pred_iou_thresh", type=float, default=0.85)
     parser.add_argument("--stability_score_thresh", type=float, default=0.85)
     parser.add_argument("--min_mask_region_area", type=float, default=600)
@@ -245,17 +242,15 @@ def main():
 
     # load image
     raw_image = np.array(Image.open(args.image_path).convert("RGB"))
-    annotated_image = raw_image.copy()
+    annotated_image = raw_image.copy()  # We'll draw all boxes+text on this copy
     H, W, _ = raw_image.shape
     print(f"Image Size: W={W}, H={H}")
 
     tmp_file = f".tmp_{time.time()}.png"
 
     if args.mode == "all":
-        # 1. Generate the masks automatically
         masks = efficientvit_mask_generator.generate(raw_image)
 
-        # 2. Visualize them on the main image (as before)
         plt.figure(figsize=(20, 20))
         plt.imshow(raw_image)
         show_anns(masks)
@@ -263,29 +258,23 @@ def main():
         plt.savefig(args.output_path, format="png", dpi=300, bbox_inches="tight", pad_inches=0.0)
         plt.close()
 
-        # 3. Additionally, crop out each mask and send to Gemini
         sorted_masks = sorted(masks, key=lambda x: x["area"], reverse=True)
 
-        # Prepare a directory for the labeled subimages
-        crop_dir = os.path.join(os.path.dirname(args.output_path), "mask_crops")
-        os.makedirs(crop_dir, exist_ok=True)
+        all_annotations = []
 
         for i, ann in enumerate(sorted_masks):
-            if i >= 30:
-              break
-              
+            if i >= 100:
+                break
+
             segmentation = ann["segmentation"].astype(np.uint8)  # shape: [H, W]
-            # Get bounding box for this particular mask
             left, top, right, bottom = get_mask_bounding_box(segmentation)
 
             # Crop the original image by that box
             sub_image = crop_image(raw_image, (left, top, right, bottom))
 
-            # 4. Send each sub-image to Gemini for annotation
             gemini_result = gemini_annotate_image(sub_image)
             annotation = gemini_result["annotation"]
 
-            # 5. (Optional) Draw that annotation text on the sub-image
             sub_image_labeled = draw_text(
                 sub_image, 
                 text=annotation, 
@@ -295,11 +284,9 @@ def main():
                 thickness=2
             )
 
-            # 6. Save or log the Gemini result
             print(f"[Gemini] Mask {i} bounding box: {(left, top, right, bottom)}")
             print(f"[Gemini] Annotation result: {annotation}")
 
-            # Save each labeled region
             cv2.rectangle(
                 annotated_image,
                 (left, top),
@@ -307,22 +294,31 @@ def main():
                 color=(0, 255, 0),  # green box
                 thickness=2
             )
-            # Draw the label text just above the box
             text_position = (left, max(top - 10, 20))
             annotated_image = draw_text(
                 annotated_image,
                 text=annotation,
                 org=text_position,
                 color=(0, 255, 0),  # green text
-                font_scale=0.3,
-                thickness=4
+                font_scale=0.7,
+                thickness=1
             )
-        
+
+            all_annotations.append({
+                "mask_index": int(i),
+                "bbox": [int(left), int(top), int(right), int(bottom)],
+                "annotation": annotation,
+            })
+
         Image.fromarray(annotated_image).save(args.output_path)
         print(f"Annotated image saved to: {args.output_path}")
 
+        json_path = os.path.abspath(args.json_path)
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(all_annotations, f, indent=2, ensure_ascii=False)
+        print(f"Mask annotations saved to JSON: {json_path}")
+
     elif args.mode == "point":
-        # If no point is specified, default to center of the image
         args.point = yaml.safe_load(f"[[{W // 2},{H // 2},{1}]]" if args.point is None else args.point)
         point_coords = [(x, y) for x, y, _ in args.point]
         point_labels = [l for _, _, l in args.point]
@@ -351,6 +347,7 @@ def main():
         Image.fromarray(plots).save(args.output_path)
 
     elif args.mode == "box":
+        # For box mode, parse the box argument
         args.box = yaml.safe_load(args.box)
         efficientvit_sam_predictor.set_image(raw_image)
         masks, _, _ = efficientvit_sam_predictor.predict(
