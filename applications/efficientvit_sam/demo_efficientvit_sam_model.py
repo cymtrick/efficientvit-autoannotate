@@ -9,6 +9,11 @@ import numpy as np
 import yaml
 from matplotlib.patches import Rectangle
 from PIL import Image
+import httpx
+import os
+import base64
+import cv2
+import google.generativeai as genai
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(os.path.dirname(BASE_DIR))
@@ -45,6 +50,9 @@ def cat_images(image_list: list[np.ndarray], axis=1, pad=20) -> np.ndarray:
 
 
 def show_anns(anns) -> None:
+    """
+    Visualize annotations as colored masks over the current matplotlib figure.
+    """
     if len(anns) == 0:
         return
     sorted_anns = sorted(anns, key=(lambda x: x["area"]), reverse=True)
@@ -61,9 +69,12 @@ def show_anns(anns) -> None:
 
 
 def draw_binary_mask(raw_image: np.ndarray, binary_mask: np.ndarray, mask_color=(0, 0, 255)) -> np.ndarray:
+    """
+    Overlay a binary mask on top of the original image.
+    """
     color_mask = np.zeros_like(raw_image, dtype=np.uint8)
     color_mask[binary_mask == 1] = mask_color
-    mix = color_mask * 0.5 + raw_image * (1 - 0.5)
+    mix = color_mask * 0.5 + raw_image * 0.5
     binary_mask = np.expand_dims(binary_mask, axis=2)
     canvas = binary_mask * mix + (1 - binary_mask) * raw_image
     canvas = np.asarray(canvas, dtype=np.uint8)
@@ -120,6 +131,59 @@ def draw_scatter(
     return image
 
 
+def get_mask_bounding_box(mask: np.ndarray) -> tuple[int, int, int, int]:
+    """
+    Given a binary mask, return the bounding box (left, top, right, bottom).
+    """
+    ys, xs = np.where(mask)
+    top, left = ys.min(), xs.min()
+    bottom, right = ys.max(), xs.max()
+    return left, top, right, bottom
+
+
+def crop_image(image: np.ndarray, bbox: tuple[int, int, int, int]) -> np.ndarray:
+    """
+    Crop the image by the given bounding box: (left, top, right, bottom).
+    """
+    (left, top, right, bottom) = bbox
+    return image[top : bottom + 1, left : right + 1]
+
+
+
+def gemini_annotate_image(image: np.ndarray) -> dict:
+    """
+    Sends a sub-image (np.ndarray) to Gemini for annotation.
+    Returns a dict with the annotation result.
+    """
+
+    # 1. Encode the np.ndarray as JPEG in memory
+    genai.configure(api_key="")
+    success, encoded_img = cv2.imencode('.jpg', image)
+    if not success:
+        raise ValueError("Failed to encode image to .jpg format.")
+
+    encoded_bytes = encoded_img.tobytes()
+    encoded_base64_str = base64.b64encode(encoded_bytes).decode('utf-8')
+
+
+    model = genai.GenerativeModel(model_name="gemini-1.5-pro")
+    prompt = "Can you extract and predict what's in this image and give the exact OCR text in the image? Text should strictly be two to three words."
+
+    response = model.generate_content(
+        [
+            {
+                'mime_type': 'image/jpeg', 
+                'data': encoded_base64_str
+            },
+            prompt
+        ]
+    )
+
+    return {
+        "status": "ok",
+        "annotation": response.text
+    }
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str)
@@ -159,14 +223,48 @@ def main():
     print(f"Image Size: W={W}, H={H}")
 
     tmp_file = f".tmp_{time.time()}.png"
+
     if args.mode == "all":
+        # 1. Generate the masks automatically
         masks = efficientvit_mask_generator.generate(raw_image)
+
+        # 2. Visualize them on the main image (as before)
         plt.figure(figsize=(20, 20))
         plt.imshow(raw_image)
         show_anns(masks)
         plt.axis("off")
         plt.savefig(args.output_path, format="png", dpi=300, bbox_inches="tight", pad_inches=0.0)
+        plt.close()
+
+        # 3. Additionally, crop out each mask and send to Gemini
+        #    (Note that each 'masks[i]' is a dict with 'segmentation' and 'area', etc.)
+        sorted_masks = sorted(masks, key=lambda x: x["area"], reverse=True)
+        for i, ann in enumerate(sorted_masks):
+            segmentation = ann["segmentation"].astype(np.uint8)  # shape: [H, W]
+            # Get bounding box for this particular mask
+            (left, top, right, bottom) = get_mask_bounding_box(segmentation)
+
+            # Crop the original image by that box
+            sub_image = crop_image(raw_image, (left, top, right, bottom))
+
+            # (Optional) If you want the sub-mask in the same dimension as sub_image:
+            #   mask_cropped = crop_image(segmentation * 255, (left, top, right, bottom))
+
+            # 4. Send each sub-image to Gemini for annotation
+            gemini_result = gemini_annotate_image(sub_image)
+
+            # 5. Save or log the Gemini result as needed
+            print(f"[Gemini] Mask {i} bounding box: {left, top, right, bottom}")
+            print(f"[Gemini] Annotation result: {gemini_result}")
+
+            # 6. Optionally, save each cropped region as an image
+            crop_dir = os.path.join(os.path.dirname(args.output_path), "mask_crops")
+            os.makedirs(crop_dir, exist_ok=True)
+            crop_filename = os.path.join(crop_dir, f"mask_{i:03d}.png")
+            Image.fromarray(sub_image).save(crop_filename)
+
     elif args.mode == "point":
+        # If no point is specified, default to center of the image
         args.point = yaml.safe_load(f"[[{W // 2},{H // 2},{1}]]" if args.point is None else args.point)
         point_coords = [(x, y) for x, y, _ in args.point]
         point_labels = [l for _, _, l in args.point]
@@ -177,19 +275,23 @@ def main():
             point_labels=np.array(point_labels),
             multimask_output=args.multimask,
         )
-        plots = [
-            draw_scatter(
-                draw_binary_mask(raw_image, binary_mask, (0, 0, 255)),
+
+        plots = []
+        for binary_mask in masks:
+            overlay = draw_binary_mask(raw_image, binary_mask, (0, 0, 255))
+            scatter_img = draw_scatter(
+                overlay,
                 point_coords,
                 color=["g" if l == 1 else "r" for l in point_labels],
                 s=10,
                 ew=0.25,
                 tmp_name=tmp_file,
             )
-            for binary_mask in masks
-        ]
+            plots.append(scatter_img)
+
         plots = cat_images(plots, axis=1)
         Image.fromarray(plots).save(args.output_path)
+
     elif args.mode == "box":
         args.box = yaml.safe_load(args.box)
         efficientvit_sam_predictor.set_image(raw_image)
@@ -199,17 +301,20 @@ def main():
             box=np.array(args.box),
             multimask_output=args.multimask,
         )
-        plots = [
-            draw_bbox(
-                draw_binary_mask(raw_image, binary_mask, (0, 0, 255)),
+        plots = []
+        for binary_mask in masks:
+            overlay = draw_binary_mask(raw_image, binary_mask, (0, 0, 255))
+            bbox_img = draw_bbox(
+                overlay,
                 [args.box],
                 color="g",
                 tmp_name=tmp_file,
             )
-            for binary_mask in masks
-        ]
+            plots.append(bbox_img)
+
         plots = cat_images(plots, axis=1)
         Image.fromarray(plots).save(args.output_path)
+
     else:
         raise NotImplementedError
 
