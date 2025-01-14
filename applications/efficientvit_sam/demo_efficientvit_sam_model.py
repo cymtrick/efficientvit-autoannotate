@@ -178,7 +178,7 @@ def gemini_annotate_image(image: np.ndarray) -> dict:
     """
 
     # 1. Configure your Google GenAI
-    genai.configure(api_key="")
+    genai.configure(api_key="AIzaSyCSZz1Ig-fLZXPkDh-dNwBCSi7sdc3AaZk")
 
     # 2. Encode the np.ndarray as JPEG in memory
     success, encoded_img = cv2.imencode('.jpg', image)
@@ -245,6 +245,7 @@ def main():
 
     # load image
     raw_image = np.array(Image.open(args.image_path).convert("RGB"))
+    annotated_image = raw_image.copy()
     H, W, _ = raw_image.shape
     print(f"Image Size: W={W}, H={H}")
 
@@ -299,8 +300,26 @@ def main():
             print(f"[Gemini] Annotation result: {annotation}")
 
             # Save each labeled region
-            crop_filename = os.path.join(crop_dir, f"mask_{i:03d}.png")
-            Image.fromarray(sub_image_labeled).save(crop_filename)
+            cv2.rectangle(
+                annotated_image,
+                (left, top),
+                (right, bottom),
+                color=(0, 255, 0),  # green box
+                thickness=2
+            )
+            # Draw the label text just above the box
+            text_position = (left, max(top - 10, 20))
+            annotated_image = draw_text(
+                annotated_image,
+                text=annotation,
+                org=text_position,
+                color=(0, 255, 0),  # green text
+                font_scale=0.3,
+                thickness=4
+            )
+        
+        Image.fromarray(annotated_image).save(args.output_path)
+        print(f"Annotated image saved to: {args.output_path}")
 
     elif args.mode == "point":
         # If no point is specified, default to center of the image
